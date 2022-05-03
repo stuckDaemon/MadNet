@@ -28,13 +28,14 @@ runs:
         OUTPUT=$(cat ./myhash.txt | sha256sum | cut -d' ' -f1)
         echo $OUTPUT
         printf "HASHLIST=${OUTPUT}" | tee --append "$GITHUB_ENV"
-    - uses: actions/cache@v3
-      name: "Cache contract bindings"
+    - name: "Cache contract bindings"
+      uses: actions/cache@v3
       id: smart-contract-cache
       with:
         path: ./bridge/bindings
         key: ${{ runner.os }}-go-${{ env.HASHLIST }}
-    - if: steps.smart-contract-cache.outputs.cache-hit != 'true'
+    - name: "Build smart contract cache [OPTIONAL]"
+      if: steps.smart-contract-cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ inputs.execution-folder }}
       run: npm run build

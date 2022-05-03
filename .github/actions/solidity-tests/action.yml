@@ -1,5 +1,6 @@
-name: 'Run the solidity unit tests in groups'
-description: 'Run the solidity unit tests in groups'
+name: 'Solidity grouped unit tests'
+description: 'Runs the solidity unit tests in groups'
+
 inputs:
   test-group:
     description: 'Regex to math the folder inside the test folder'
@@ -10,19 +11,20 @@ inputs:
   sub-filter-exclude:
     description: 'Sub folder to exclude in the search'
     required: false
-runs:
-  using: "composite"
 
+runs:
+  using: "composite"    # It contains a list of steps to run as opposed to a program to execute
   steps:
-  - shell: bash
-    working-directory: ./bridge
-    run: npm run clean && npm run compile
-  - shell: bash
+      # It is called right after /node-cache actions. I don't think this step is necessary. To Be Verified
+        #  - shell: bash
+        #    working-directory: ./bridge
+        #    run: npm run clean && npm run compile
+  - name: "Solidity test"
+    shell: bash
     working-directory: ./bridge
     run: |
       SUB_FILTER_INCLUDE=/${{ inputs.sub-filter-include }}
-      # if inputs.sub-filter-include is empty we have to remove '/' if not
-      # the find command bellow will fail
+      # if inputs.sub-filter-include is empty we have to remove '/' otherwise the find command bellow will fail
       if [[ "$SUB_FILTER_INCLUDE" == "/" ]];  then
         SUB_FILTER_INCLUDE=""
       fi

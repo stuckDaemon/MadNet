@@ -1,4 +1,4 @@
-name: 'Setup golang and its cache'
+name: 'Golang cache'
 description: 'Setup golang and its cache'
 runs:
   using: "composite"
