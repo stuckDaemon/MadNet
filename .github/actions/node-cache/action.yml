@@ -3,15 +3,19 @@ description: 'Configure node js and its cache'
 runs:
   using: "composite"
   steps:
-  - uses: actions/setup-node@v3
+  - name: "Setup node"
+    uses: actions/setup-node@v3
     with:
       node-version: ${{ env.NODE_VERSION }}
-  - name: Node Cache
+
+  - name: "Node Cache"
     id: node-cache
-    uses: actions/cache@v3.0.2
+    uses: actions/cache@v3.0.2  # This action allows caching dependencies and build outputs to improve workflow execution time.
     with:
       path: '**/node_modules'
       key: ${{ runner.os }}-modules-${{ hashFiles('**/package-lock.json') }}
-  - if: steps.node-cache.outputs.cache-hit != 'true'
+
+  - name: "Build node cache [OPTIONAL]"
+    if: steps.node-cache.outputs.cache-hit != 'true'
     shell: bash
     run: npm ci && npm run clean && npm run compile

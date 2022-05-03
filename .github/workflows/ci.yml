@@ -1,10 +1,12 @@
-name: Alicenet CI
+name: "Alicenet CI"
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main, candidate ]
+    branches: [ candidate ]
   pull_request:
-    branches: [ main, candidate ]
+    branches: [ candidate ]
+    types: [ ready_for_review ]
 
 env:
   NODE_VERSION: 16.x
@@ -18,7 +20,7 @@ defaults:
     shell: bash
 
 jobs:
-
+    # Build solidity
   solidity-build:
     runs-on: ubuntu-20.04
     timeout-minutes: 10
@@ -26,12 +28,14 @@ jobs:
       run:
         working-directory: ./bridge
     steps:
-    - uses: actions/checkout@v3
-    - uses: ./.github/actions/node-cache
+      - uses: actions/checkout@v3
+      - uses: ./.github/actions/node-cache      # calling node-cache action
 
+    # Solidity unit tests
   solidity-unit-tests:
     runs-on: ubuntu-20.04
     timeout-minutes: 15
+    needs: solidity-build
     strategy:
       matrix:
         # when adding a new test folder to the smart contracts make sure to
@@ -48,21 +52,20 @@ jobs:
           - test-group: "[f-qF-Q]"
           - test-group: "[r-sR-S]"
           - test-group: "[t-zT-Z]"
-
-    needs: solidity-build
     defaults:
       run:
         working-directory: ./bridge
     steps:
       - uses: actions/checkout@v3
-      - uses: ./.github/actions/node-cache
-      - uses: ./.github/actions/solidity-tests
+      - uses: ./.github/actions/node-cache      # calling node-cache action
+      - uses: ./.github/actions/solidity-tests  # calling solidity-test action
         with:
           test-group: ${{ matrix.test-group }}
           sub-filter-include: ${{ matrix.sub-filter-include }}
           sub-filter-exclude: ${{ matrix.sub-filter-exclude }}
 
-  solidity-linter:
+# Linters
+  linter-solidity:
     runs-on: ubuntu-20.04
     timeout-minutes: 10
     needs: solidity-build
@@ -71,10 +74,11 @@ jobs:
         working-directory: ./bridge
     steps:
       - uses: actions/checkout@v3
-      - uses: ./.github/actions/node-cache
-      - run: npm run lint-solidity
+      - uses: ./.github/actions/node-cache      # calling node-cache action
+      - name: "Run solidity linter"
+        run: npm run lint-solidity
 
-  typescript-linter:
+  linter-typescript:
     runs-on: ubuntu-20.04
     timeout-minutes: 10
     needs: solidity-build
@@ -84,68 +88,73 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v3
-      - uses: ./.github/actions/node-cache
-      - run: npm run clean && npm run compile && npm run typechain
-      - run: npm run lint
+      - uses: ./.github/actions/node-cache      # calling node-cache action
+      - name: "Run hardhat typechain"
+        run: npm run typechain
+      - name: "Run eslint linter"
+        run: npm run lint
+
+  linter-golang:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 10
+    needs: golang-build
+    steps:
+      - uses: actions/checkout@v3
+      - uses: ./.github/actions/node-cache              # calling node-cache action
+      - uses: ./.github/actions/golang-cache            # calling golang-cache action
+      - uses: ./.github/actions/alicenet-config         # calling alicenet-config action
+      - uses: ./.github/actions/smart-contract-cache    # calling smart-contract-cache action
+        with:
+            execution-folder: "./bridge"
+      - uses: ./.github/actions/alicenet-cache          # calling alicenet-cache action
+      - name: "Run golang linter"
+        uses: golangci/golangci-lint-action@v3
+
+  linter-golang-vet:
+      runs-on: ubuntu-20.04
+      timeout-minutes: 10
+      needs: golang-build
+      steps:
+        - uses: actions/checkout@v3
+        - uses: ./.github/actions/golang-cache            # calling golang-cache action
+        - uses: ./.github/actions/alicenet-config         # calling alicenet-config action
+        - name: "Run go vet"
+          run: go vet ./...
 
   golang-build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-20.04
     timeout-minutes: 10
     needs: solidity-build
-    strategy:
-      matrix:
-        os: [ubuntu-20.04]
     steps:
       - name: "Sanitize branch name"
         run: |
-            echo "BRANCH_NAME=$(echo ${{ github.head_ref || github.ref_name }} | sed -E 's/[^[:alnum:]]+/_/g')" >> $GITHUB_ENV
-            echo "OPERATING_SYSTEM=$(echo ${{ matrix.os }} | sed -E 's/[^[:alnum:]]+/_/g')" >> $GITHUB_ENV
+          echo "BRANCH_NAME=$(echo ${{ github.head_ref || github.ref_name }} | sed -E 's/[^[:alnum:]]+/_/g')" >> $GITHUB_ENV
+          echo "OPERATING_SYSTEM=$(echo ${{ matrix.os }} | sed -E 's/[^[:alnum:]]+/_/g')" >> $GITHUB_ENV
       - uses: actions/checkout@v3
-      - uses: ./.github/actions/alicenet-config
-      - run: make build
-      - name: Upload a Build Artifact
+      - uses: ./.github/actions/smart-contract-cache    # calling smart-contract-cache action
+      - uses: ./.github/actions/golang-cache            # calling golang-cache action
+      - uses: ./.github/actions/alicenet-config         # calling alicenet-config action
+      - name: "Run make build"
+        run: make build
+      - name: "Upload the built artifact"
         uses: actions/upload-artifact@v3.0.0
         with:
           name: alicenet-${{ env.BRANCH_NAME }}-${{ env.OPERATING_SYSTEM }}
           path: ./madnet
 
-  golang-vet:
-    runs-on: ubuntu-20.04
-    timeout-minutes: 10
-    needs: golang-build
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v3
-      - uses: ./.github/actions/alicenet-config
-      - run: go vet ./...
-
-  golang-linter:
-    runs-on: ubuntu-20.04
-    timeout-minutes: 10
-    needs: golang-build
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v3
-      - uses: ./.github/actions/alicenet-config
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v3
-
   golang-unit-tests:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-20.04
     timeout-minutes: 15
     needs: golang-build
-    strategy:
-      matrix:
-        os: [ubuntu-20.04]
     steps:
       - uses: actions/checkout@v3
-      - uses: ./.github/actions/alicenet-config
-      # tool to format the test output
-      - name: Set up gotestfmt
+      - uses: ./.github/actions/golang-cache            # calling golang-cache action
+      - uses: ./.github/actions/alicenet-config         # calling alicenet-config action
+      - name: "Set up gotestfmt pretty printer logging"
         run: go install github.com/haveyoudebuggedit/gotestfmt/v2/cmd/gotestfmt@latest
       # Run tests with nice formatting. Save the original log in /tmp/gotest.log
       # packages where the tests are stuck: ["blockchain", "badgerTrie", "consensus", "transport"]
-      - name: Run tests
+      - name: "Run tests"
         run: |
           set -euo pipefail
           go test -json -v $(go list ./... | grep -Ev '/blockchain|/badgerTrie|/consensus|/transport|/testutils') 2>&1 | tee /tmp/gotest.log | gotestfmt
