@@ -2,8 +2,8 @@ name: "Alicenet CI"
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ candidate ]
+#  push:
+#    branches: [ candidate ]
   pull_request:
     branches: [ candidate ]
     types: [ ready_for_review ]
