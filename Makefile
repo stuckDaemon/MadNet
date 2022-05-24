@@ -34,7 +34,8 @@ generate-go: init
 clean:
 	go clean
 	rm -f $(BINARY_NAME) $(RACE_DETECTOR) localrpc/swagger-bindata/bindata.go localrpc/swagger/localstate.swagger.json
-	shopt -s globstar && rm -rf \
+	shopt -s globstar || true
+		rm -rf \
 		**/*.capnp.go \
 		test/mocks/*.mockgen.go \
 		proto/*.pb.go proto/*.pb.gw.go proto/*_mngen.go proto/*_mngen_test.go \
