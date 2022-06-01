@@ -18,7 +18,7 @@ type MockITaskWithExecutionData struct {
 
 func NewMockITaskWithExecutionData(start uint64, end uint64) *MockITaskWithExecutionData {
 	task := NewMockITask()
-	ed := objects.NewTask(objects.NewDkgState(accounts.Account{}), start, end)
+	ed := objects.NewTask(objects.NewDkgState(accounts.Account{}), "", start, end)
 	task.GetExecutionDataFunc.SetDefaultReturn(ed)
 	task.DoWorkFunc.SetDefaultHook(func(context.Context, *logrus.Entry, interfaces.Ethereum) error {
 		ed.TxOpts.TxHashes = append(ed.TxOpts.TxHashes, common.BigToHash(big.NewInt(131231214123871239)))
