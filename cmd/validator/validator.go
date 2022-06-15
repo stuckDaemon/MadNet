@@ -2,10 +2,10 @@ package validator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/MadBase/MadNet/blockchain/executor/interfaces"
 	"github.com/MadBase/MadNet/blockchain/transaction"
@@ -40,9 +40,7 @@ import (
 	"github.com/MadBase/MadNet/status"
 	mnutils "github.com/MadBase/MadNet/utils"
 	"github.com/dgraph-io/badger/v2"
-	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/spf13/cobra"
 )
 
@@ -53,7 +51,7 @@ var Command = cobra.Command{
 	Long:  "Runs a MadNet node in mining or non-mining mode",
 	Run:   validatorNode}
 
-func initEthereumConnection(logger *logrus.Logger) (ethereum.Network, *keystore.Key, []byte) {
+func initEthereumConnection(logger *logrus.Logger) (ethereum.Network, *mncrypto.Secp256k1Signer, []byte) {
 	// Ethereum connection setup
 	logger.Infof("Connecting to Ethereum...")
 	eth, err := ethereum.NewEndpoint(
@@ -61,7 +59,7 @@ func initEthereumConnection(logger *logrus.Logger) (ethereum.Network, *keystore.
 		config.Configuration.Ethereum.Keystore,
 		config.Configuration.Ethereum.PassCodes,
 		config.Configuration.Ethereum.DefaultAccount,
-		constants.DefaultFinalityDelay,
+		constants.EthereumFinalityDelay,
 		config.Configuration.Ethereum.TxMaxGasFeeAllowedInGwei,
 		config.Configuration.Ethereum.EndpointMinimumPeers)
 
@@ -79,32 +77,17 @@ func initEthereumConnection(logger *logrus.Logger) (ethereum.Network, *keystore.
 	eth.Contracts().Initialize(context.Background(), common.HexToAddress(config.Configuration.Ethereum.FactoryAddress))
 	utils.LogStatus(logger.WithField("Component", "validator"), eth)
 
-	watcher := transaction.WatcherFromNetwork(eth)
-
-	// todo: fix this
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			ctx, cf := context.WithTimeout(context.Background(), 5*time.Second)
-			err := watcher.Status(ctx)
-			if err != nil {
-				logger.Errorf("Queue status: %v", err)
-			}
-			cf()
-		}
-	}()
-
-	// Load accounts
-	acct := eth.GetDefaultAccount()
-	keys, err := eth.GetAccountKeys(acct.Address)
+	secp256k1, err := eth.CreateSecp256k1Signer()
 	if err != nil {
-		logger.Fatalf("Could not get GetAccountKeys: %v", err)
-		panic(err)
+		panic(fmt.Sprintf("Failed to create secp global signer: %v", err))
 	}
-	publicKey := crypto.FromECDSAPub(&keys.PrivateKey.PublicKey)
-	logger.Infof("Account: %v Public Key: 0x%x", acct.Address.Hex(), publicKey)
+	pubKey, err := secp256k1.Pubkey()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to get public key from secp256 signer: %v", err))
+	}
+	logger.Infof("Account: %v Public Key: 0x%x", eth.GetDefaultAccount().Address.Hex(), pubKey)
 
-	return eth, keys, publicKey
+	return eth, secp256k1, pubKey
 }
 
 // Setup the peer manager:
@@ -200,7 +183,7 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	chainID := uint32(config.Configuration.Chain.ID)
 	batchSize := config.Configuration.Monitor.BatchSize
 
-	eth, keys, publicKey := initEthereumConnection(logger)
+	eth, secp256k1Signer, publicKey := initEthereumConnection(logger)
 	defer eth.Close()
 
 	// Initialize consensus db: stores all state the consensus mechanism requires to work
@@ -253,20 +236,12 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	// define storage to dynamic values
 	storage := &dynamics.Storage{}
 
-	// account signer for ETH accounts
-	secp256k1Signer := &mncrypto.Secp256k1Signer{}
-
 	// stdout logger
 	statusLogger := &status.Logger{}
 
 	peerManager := initPeerManager(consGossipHandlers, consReqHandler)
 
 	ipcServer := ipc.NewServer(config.Configuration.Firewalld.SocketFile)
-
-	// Initialize the consensus engine signer
-	if err := secp256k1Signer.SetPrivk(crypto.FromECDSA(keys.PrivateKey)); err != nil {
-		panic(err)
-	}
 
 	consDB.Init(rawConsensusDb)
 	consTxPool.Init(consDB)
@@ -294,12 +269,16 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	consAdminHandlers.Init(chainID, consDB, mncrypto.Hasher([]byte(config.Configuration.Validator.SymmetricKey)), app, publicKey, storage, ipcServer)
 	consLSEngine.Init(consDB, consDlManager, app, secp256k1Signer, consAdminHandlers, publicKey, consReqClient, storage)
 
+	// Layer 1 transaction watcher
+	txWatcher := transaction.WatcherFromNetwork(eth, consDB, config.Configuration.Ethereum.TxMetricsDisplay)
+	defer txWatcher.Close()
+
 	// Setup tasks scheduler
 	taskRequestChan := make(chan interfaces.ITask, 100)
 	taskKillChan := make(chan string, 100)
 	defer close(taskRequestChan)
 	defer close(taskKillChan)
-	tasksScheduler := executor.NewTasksScheduler(consDB, eth, consAdminHandlers, taskRequestChan, taskKillChan)
+	tasksScheduler := executor.NewTasksScheduler(monDB, eth, consAdminHandlers, taskRequestChan, taskKillChan, txWatcher)
 
 	// Setup monitor
 	monDB.Init(rawMonitorDb)
@@ -311,7 +290,7 @@ func validatorNode(cmd *cobra.Command, args []string) {
 
 	var tDB, mDB *badger.DB = nil, nil
 	if config.Configuration.Chain.TransactionDbInMemory {
-		// prevent value log GC on in memory by setting to nil - this will cause syncronizer to bypass GC on these databases
+		// prevent value log GC on in memory by setting to nil - this will cause synchronizer to bypass GC on these databases
 		tDB = rawTxPoolDb
 	}
 	if config.Configuration.Chain.MonitorDbInMemory {
@@ -332,6 +311,9 @@ func validatorNode(cmd *cobra.Command, args []string) {
 
 	go statusLogger.Run()
 	defer statusLogger.Close()
+
+	txWatcher.StartLoop()
+	defer txWatcher.Close()
 
 	err = tasksScheduler.Start()
 	if err != nil {

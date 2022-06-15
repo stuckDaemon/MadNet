@@ -18,6 +18,8 @@ const (
 	TxReceiptCacheMaxBlocks uint64 = 100
 	// time which we should poll the layer1 node to check for new blocks
 	TxPollingTime time.Duration = 7 * time.Second
+	// time which we should poll the layer1 node to check for new blocks
+	TxStatusTime time.Duration = 60 * time.Second
 	// max timeout for all rpc call requests during an iteration
 	TxNetworkTimeout time.Duration = 2 * time.Second
 	// Timeout for the monitor Tx workers
@@ -40,4 +42,7 @@ const (
 	EthereumTxMaxStaleBlocks uint64 = 10
 	// Minimum value that we accept for a txMaxGasFeeAllowedInGwei config parameter
 	EthereumMinGasFeeAllowedInGwei uint64 = 300
+	// Default finality delay value. Mostly used as fallback in case we cannot
+	// retrieve the current finality delay used via smart contracts.
+	EthereumFinalityDelay uint64 = 12
 )

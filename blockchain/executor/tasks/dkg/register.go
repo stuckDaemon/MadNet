@@ -1,18 +1,18 @@
 package dkg
 
 import (
-	"context"
+	"fmt"
 	"math/big"
 
-	"github.com/MadBase/MadNet/blockchain/ethereum"
+	"github.com/dgraph-io/badger/v2"
+	"github.com/ethereum/go-ethereum/core/types"
+
 	"github.com/MadBase/MadNet/blockchain/executor/constants"
 	"github.com/MadBase/MadNet/blockchain/executor/interfaces"
+	executorInterfaces "github.com/MadBase/MadNet/blockchain/executor/interfaces"
 	"github.com/MadBase/MadNet/blockchain/executor/objects"
 	"github.com/MadBase/MadNet/blockchain/executor/tasks/dkg/state"
 	dkgUtils "github.com/MadBase/MadNet/blockchain/executor/tasks/dkg/utils"
-	exUtils "github.com/MadBase/MadNet/blockchain/executor/tasks/utils"
-	"github.com/MadBase/MadNet/blockchain/transaction"
-	"github.com/sirupsen/logrus"
 )
 
 // RegisterTask contains required state for safely performing a registration
@@ -24,169 +24,132 @@ type RegisterTask struct {
 var _ interfaces.ITask = &RegisterTask{}
 
 // NewRegisterTask creates a background task that attempts to register with ETHDKG
-func NewRegisterTask(dkgState *state.DkgState, start uint64, end uint64) *RegisterTask {
+func NewRegisterTask(start uint64, end uint64) *RegisterTask {
 	return &RegisterTask{
-		Task: objects.NewTask(dkgState, constants.RegisterTaskName, start, end),
+		Task: objects.NewTask(constants.RegisterTaskName, start, end, false, true),
 	}
 }
 
-// Initialize begins the setup phase for Register.
+// Prepare prepares for work to be done in the RegisterTask
 // We construct our TransportPrivateKey and TransportPublicKey
 // which will be used in the ShareDistribution phase for secure communication.
 // These keys are *not* used otherwise.
 // Also get the list of existing validators from the pool to assert accusation
 // in later phases
-func (t *RegisterTask) Initialize(ctx context.Context, logger *logrus.Entry, eth ethereum.Network) error {
+func (t *RegisterTask) Prepare() *executorInterfaces.TaskErr {
+	logger := t.GetLogger().WithField("method", "Prepare()")
+	logger.Tracef("preparing task")
 
-	t.State.Lock()
-	defer t.State.Unlock()
-
-	logger.Infof("RegisterTask Initialize()")
-
-	taskState, ok := t.State.(*state.DkgState)
-	if !ok {
-		return objects.ErrCanNotContinue
-	}
-
-	if taskState.TransportPrivateKey == nil ||
-		taskState.TransportPrivateKey.Cmp(big.NewInt(0)) == 0 {
-
-		logger.Infof("RegisterTask Initialize(): generating private-public transport keys")
-		priv, pub, err := state.GenerateKeys()
+	dkgState := &state.DkgState{}
+	var isRecoverable bool
+	err := t.GetDB().Update(func(txn *badger.Txn) error {
+		err := dkgState.LoadState(txn)
 		if err != nil {
+			isRecoverable = false
 			return err
 		}
-		taskState.TransportPrivateKey = priv
-		taskState.TransportPublicKey = pub
-	} else {
-		logger.Infof("RegisterTask Initialize(): private-public transport keys already defined")
+
+		if dkgState.TransportPrivateKey == nil ||
+			dkgState.TransportPrivateKey.Cmp(big.NewInt(0)) == 0 {
+
+			logger.Infof("generating private-public transport keys")
+			priv, pub, err := state.GenerateKeys()
+			if err != nil {
+				isRecoverable = true
+				return err
+			}
+			dkgState.TransportPrivateKey = priv
+			dkgState.TransportPublicKey = pub
+
+			err = dkgState.PersistState(txn)
+			if err != nil {
+				isRecoverable = false
+				return err
+			}
+		} else {
+			logger.Infof("private-public transport keys already defined")
+		}
+		return nil
+	})
+
+	if err != nil {
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("error during the preparation: %v", err), isRecoverable)
 	}
 
 	return nil
 }
 
-// DoWork is the first attempt at registering with ethdkg
-func (t *RegisterTask) DoWork(ctx context.Context, logger *logrus.Entry, eth ethereum.Network) error {
-	return t.doTask(ctx, logger, eth)
-}
+// Execute executes the task business logic
+func (t *RegisterTask) Execute() ([]*types.Transaction, *executorInterfaces.TaskErr) {
+	logger := t.GetLogger().WithField("method", "RegisterTask.Execute()")
+	logger.Trace("initiate execution")
 
-// DoRetry is all subsequent attempts at registering with ethdkg
-func (t *RegisterTask) DoRetry(ctx context.Context, logger *logrus.Entry, eth ethereum.Network) error {
-	return t.doTask(ctx, logger, eth)
-}
-
-func (t *RegisterTask) doTask(ctx context.Context, logger *logrus.Entry, eth ethereum.Network) error {
-	t.State.Lock()
-	defer t.State.Unlock()
-
-	taskState, ok := t.State.(*state.DkgState)
-	if !ok {
-		return objects.ErrCanNotContinue
-	}
-
-	// Is there any point in running? Make sure we're both initialized and within block range
+	eth := t.GetEth()
+	ctx := t.GetCtx()
 	block, err := eth.GetCurrentHeight(ctx)
 	if err != nil {
-		return err
+		return nil, executorInterfaces.NewTaskErr(fmt.Sprintf("failed to get current height : %v", err), true)
 	}
 
-	logger.Info("RegisterTask doTask()")
+	dkgState := &state.DkgState{}
+	err = t.GetDB().View(func(txn *badger.Txn) error {
+		err := dkgState.LoadState(txn)
+		return err
+	})
+	if err != nil {
+		return nil, executorInterfaces.NewTaskErr(fmt.Sprintf("error loading dkgState: %v", err), false)
+	}
 
 	// Setup
-	txnOpts, err := eth.GetTransactionOpts(ctx, taskState.Account)
+	txnOpts, err := eth.GetTransactionOpts(ctx, dkgState.Account)
 	if err != nil {
-		return dkgUtils.LogReturnErrorf(logger, "getting txn opts failed: %v", err)
-	}
-
-	// If the TxOpts exists, meaning the Tx replacement timeout was reached,
-	// we increase the Gas to have priority for the next blocks
-	if t.TxOpts != nil && t.TxOpts.Nonce != nil {
-		logger.Info("txnOpts Replaced")
-		txnOpts.Nonce = t.TxOpts.Nonce
-		txnOpts.GasFeeCap = t.TxOpts.GasFeeCap
-		txnOpts.GasTipCap = t.TxOpts.GasTipCap
+		return nil, executorInterfaces.NewTaskErr(fmt.Sprintf("getting txn opts failed: %v", err), true)
 	}
 
 	// Register
-	logger.Infof("Registering  publicKey (%v) with ETHDKG", dkgUtils.FormatPublicKey(taskState.TransportPublicKey))
-	logger.Debugf("registering on block %v with public key: %v", block, dkgUtils.FormatPublicKey(taskState.TransportPublicKey))
-	txn, err := eth.Contracts().Ethdkg().Register(txnOpts, taskState.TransportPublicKey)
+	logger.Infof("Registering  publicKey (%v) with ETHDKG", dkgUtils.FormatPublicKey(dkgState.TransportPublicKey))
+	logger.Debugf("registering on block %v with public key: %v", block, dkgUtils.FormatPublicKey(dkgState.TransportPublicKey))
+	txn, err := eth.Contracts().Ethdkg().Register(txnOpts, dkgState.TransportPublicKey)
 	if err != nil {
-		logger.Errorf("registering failed: %v", err)
-		return err
+		return nil, executorInterfaces.NewTaskErr(fmt.Sprintf("registering failed: %v", err), true)
 	}
-	t.TxOpts.TxHashes = append(t.TxOpts.TxHashes, txn.Hash())
-	t.TxOpts.GasFeeCap = txn.GasFeeCap()
-	t.TxOpts.GasTipCap = txn.GasTipCap()
-	t.TxOpts.Nonce = big.NewInt(int64(txn.Nonce()))
 
-	logger.WithFields(logrus.Fields{
-		"GasFeeCap": t.TxOpts.GasFeeCap,
-		"GasTipCap": t.TxOpts.GasTipCap,
-		"Nonce":     t.TxOpts.Nonce,
-	}).Info("registering fees")
-
-	// Queue transaction
-	watcher := transaction.WatcherFromNetwork(eth)
-	watcher.Subscribe(ctx, txn)
-
-	t.Success = true
-
-	return nil
+	return []*types.Transaction{txn}, nil
 }
 
-// ShouldRetry checks if it makes sense to try again
-// Predicates:
-// -- we haven't passed the last block
-// -- the registration open hasn't moved, i.e. ETHDKG has not restarted
-func (t *RegisterTask) ShouldRetry(ctx context.Context, logger *logrus.Entry, eth ethereum.Network) bool {
-	t.State.Lock()
-	defer t.State.Unlock()
+// ShouldExecute checks if it makes sense to execute the task
+func (t *RegisterTask) ShouldExecute() *executorInterfaces.TaskErr {
+	logger := t.GetLogger().WithField("method", "RegisterTask.ShouldExecute()")
+	logger.Trace("should execute task")
 
-	logger.Info("RegisterTask ShouldRetry")
-	generalRetry := exUtils.GeneralTaskShouldRetry(ctx, logger, eth, t.Start, t.End)
-	if !generalRetry {
-		return false
-	}
-
-	taskState, ok := t.State.(*state.DkgState)
-	if !ok {
-		logger.Error("RegisterTask ShouldRetry invalid convertion of taskState object")
-		return false
-	}
-
-	if taskState.Phase != state.RegistrationOpen {
-		return false
-	}
-
-	callOpts, err := eth.GetCallOpts(ctx, taskState.Account)
+	dkgState := &state.DkgState{}
+	err := t.GetDB().View(func(txn *badger.Txn) error {
+		err := dkgState.LoadState(txn)
+		return err
+	})
 	if err != nil {
-		logger.Errorf("RegisterTask ShouldRetry failed getting call options: %v", err)
-		return true
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("could not get dkgState with error %v", err), false)
 	}
 
-	var needsRegistration bool
-	status, err := state.CheckRegistration(eth.Contracts().Ethdkg(), logger, callOpts, taskState.Account.Address, taskState.TransportPublicKey)
+	eth := t.GetEth()
+	ctx := t.GetCtx()
+	if dkgState.Phase != state.RegistrationOpen {
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("phase %v different from RegistrationOpen", dkgState.Phase), false)
+	}
+
+	callOpts, err := eth.GetCallOpts(ctx, dkgState.Account)
+	if err != nil {
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("failed getting call options: %v", err), true)
+	}
+
+	status, err := state.CheckRegistration(eth.Contracts().Ethdkg(), logger, callOpts, dkgState.Account.Address, dkgState.TransportPublicKey)
 	logger.Infof("registration status: %v", status)
 	if err != nil {
-		needsRegistration = true
-	} else {
-		if status != state.Registered && status != state.BadRegistration {
-			needsRegistration = true
-		}
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("failed to check registration %v", err), true)
+	}
+	if status == state.Registered || status == state.BadRegistration {
+		return executorInterfaces.NewTaskErr(fmt.Sprintf("registration already occurred %v", status), false)
 	}
 
-	return needsRegistration
-}
-
-// DoDone just creates a log entry saying task is complete
-func (t *RegisterTask) DoDone(logger *logrus.Entry) {
-	t.State.Lock()
-	defer t.State.Unlock()
-
-	logger.WithField("Success", t.Success).Infof("RegisterTask done")
-}
-
-func (t *RegisterTask) GetExecutionData() interfaces.ITaskExecutionData {
-	return t.Task
+	return nil
 }

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/MadBase/MadNet/blockchain/executor/tasks/snapshots/state"
+	"github.com/MadBase/MadNet/constants/dbprefix"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +36,6 @@ var (
 	// ErrUnknownResponse only used when response to a service is not of the expected type
 	ErrUnknownResponse = errors.New("response isn't in expected form")
 )
-
-func getStateKey() []byte {
-	return []byte("monitorStateKey")
-}
 
 // Monitor describes required functionality to monitor Ethereum
 type Monitor interface {
@@ -70,7 +68,7 @@ type monitor struct {
 
 // NewMonitor creates a new Monitor
 func NewMonitor(cdb *db.Database,
-	db *db.Database,
+	monDB *db.Database,
 	adminHandler monInterfaces.IAdminHandler,
 	depositHandler monInterfaces.IDepositHandler,
 	eth ethereum.Network,
@@ -85,7 +83,7 @@ func NewMonitor(cdb *db.Database,
 	})
 
 	eventMap := objects.NewEventMap()
-	err := events.SetupEventMap(eventMap, cdb, adminHandler, depositHandler, taskRequestChan, taskKillChan)
+	err := events.SetupEventMap(eventMap, cdb, monDB, adminHandler, depositHandler, taskRequestChan, taskKillChan)
 	if err != nil {
 		return nil, err
 	}
@@ -93,13 +91,9 @@ func NewMonitor(cdb *db.Database,
 	wg := new(sync.WaitGroup)
 	State := objects.NewMonitorState()
 
-	//TODO: What to do with this after adding the new TasksScheduler???
 	adminHandler.RegisterSnapshotCallback(func(bh *objs.BlockHeader) error {
-		ctx, cf := context.WithTimeout(context.Background(), constants.MonitorTimeout)
-		defer cf()
-
 		logger.Info("Entering snapshot callback")
-		return PersistSnapshot(eth, bh, taskRequestChan, ctx, cf)
+		return PersistSnapshot(eth, bh, taskRequestChan, monDB)
 	})
 
 	return &monitor{
@@ -108,7 +102,7 @@ func NewMonitor(cdb *db.Database,
 		eth:             eth,
 		eventMap:        eventMap,
 		cdb:             cdb,
-		db:              db,
+		db:              monDB,
 		logger:          logger,
 		tickInterval:    tickInterval,
 		timeout:         constants.MonitorTimeout,
@@ -129,9 +123,9 @@ func (mon *monitor) LoadState() error {
 	defer mon.Unlock()
 
 	if err := mon.db.View(func(txn *badger.Txn) error {
-		keyLabel := fmt.Sprintf("%x", getStateKey())
-		mon.logger.WithField("Key", keyLabel).Infof("Looking up state")
-		rawData, err := utils.GetValue(txn, getStateKey())
+		key := dbprefix.PrefixMonitorState()
+		mon.logger.WithField("Key", string(key)).Infof("Looking up state")
+		rawData, err := utils.GetValue(txn, key)
 		if err != nil {
 			return err
 		}
@@ -161,9 +155,9 @@ func (mon *monitor) PersistState() error {
 	}
 
 	err = mon.db.Update(func(txn *badger.Txn) error {
-		keyLabel := fmt.Sprintf("%x", getStateKey())
-		mon.logger.WithField("Key", keyLabel).Infof("Saving state")
-		if err := utils.SetValue(txn, getStateKey(), rawData); err != nil {
+		key := dbprefix.PrefixMonitorState()
+		mon.logger.WithField("Key", string(key)).Infof("Saving state")
+		if err := utils.SetValue(txn, key, rawData); err != nil {
 			mon.logger.Error("Failed to set Value")
 			return err
 		}
@@ -440,11 +434,26 @@ func ProcessEvents(eth ethereum.Network, monitorState *objects.MonitorState, log
 }
 
 // PersistSnapshot should be registered as a callback and be kicked off automatically by badger when appropriate
-func PersistSnapshot(eth ethereum.Network, bh *objs.BlockHeader, taskRequestChan chan<- interfaces.ITask, ctx context.Context, cancel context.CancelFunc) error {
+func PersistSnapshot(eth ethereum.Network, bh *objs.BlockHeader, taskRequestChan chan<- interfaces.ITask, monDB *db.Database) error {
 	if bh == nil {
 		return errors.New("invalid blockHeader for snapshot")
 	}
-	snapshotTask := snapshots.NewSnapshotTask(eth.GetDefaultAccount(), bh, 0, 0, ctx, cancel)
+
+	snapshotState := &state.SnapshotState{
+		Account:     eth.GetDefaultAccount(),
+		BlockHeader: bh,
+	}
+
+	err := monDB.Update(func(txn *badger.Txn) error {
+		err := snapshotState.PersistState(txn)
+		return err
+	})
+
+	if err != nil {
+		return err
+	}
+
+	snapshotTask := snapshots.NewSnapshotTask(0, 0)
 	taskRequestChan <- snapshotTask
 
 	return nil

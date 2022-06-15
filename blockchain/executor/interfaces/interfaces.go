@@ -4,45 +4,60 @@ import (
 	"context"
 
 	"github.com/MadBase/MadNet/blockchain/ethereum"
-	"github.com/google/uuid"
+	"github.com/MadBase/MadNet/consensus/db"
+	"github.com/dgraph-io/badger/v2"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/sirupsen/logrus"
 )
 
+type TaskErr struct {
+	message       string
+	isRecoverable bool
+}
+
+func (e *TaskErr) Error() string {
+	return e.message
+}
+
+func (e *TaskErr) IsRecoverable() bool {
+	return e.isRecoverable
+}
+
+func NewTaskErr(message string, isRecoverable bool) *TaskErr {
+	return &TaskErr{message: message, isRecoverable: isRecoverable}
+}
+
 // ITask the interface requirements of a task
 type ITask interface {
-	DoDone(*logrus.Entry)
-	DoRetry(context.Context, *logrus.Entry, ethereum.Network) error
-	DoWork(context.Context, *logrus.Entry, ethereum.Network) error
-	Initialize(context.Context, *logrus.Entry, ethereum.Network) error
-	ShouldRetry(context.Context, *logrus.Entry, ethereum.Network) bool
-	GetExecutionData() ITaskExecutionData
-}
-
-type ITaskState interface {
-	Lock()
-	Unlock()
-}
-
-type ITaskExecutionData interface {
-	Lock()
-	Unlock()
-	ClearTxData()
+	Initialize(ctx context.Context, cancelFunc context.CancelFunc, database *db.Database, logger *logrus.Entry, eth ethereum.Network, id string, taskResponseChan ITaskResponseChan)
+	Prepare() *TaskErr
+	Execute() ([]*types.Transaction, *TaskErr)
+	ShouldExecute() *TaskErr
+	Finish(err error)
+	Close()
+	GetId() string
 	GetStart() uint64
 	GetEnd() uint64
 	GetName() string
-	SetId(string)
-	SetContext(ctx context.Context, cancel context.CancelFunc)
-	Close()
+	GetAllowMultiExecution() bool
+	GetAllowTxFeeAutoReplacement() bool
+	GetCtx() context.Context
+	GetEth() ethereum.Network
+	GetLogger() *logrus.Entry
 }
 
-// IScheduler simple interface to a block based schedule
-type IScheduler interface {
-	Schedule(start uint64, end uint64, thing ITask) (uuid.UUID, error)
-	Purge()
-	PurgePrior(now uint64)
-	Find(now uint64) (uuid.UUID, error)
-	Retrieve(taskId uuid.UUID) (ITask, error)
-	Length() int
-	Remove(taskId uuid.UUID) error
-	Status(logger *logrus.Entry)
+// ITaskState the interface requirements of a task state
+type ITaskState interface {
+	PersistState(txn *badger.Txn) error
+	LoadState(txn *badger.Txn) error
+}
+
+type TaskResponse struct {
+	Id  string
+	Err error
+}
+
+// ITaskResponseChan the interface requirements of a task response chan
+type ITaskResponseChan interface {
+	Add(TaskResponse)
 }
