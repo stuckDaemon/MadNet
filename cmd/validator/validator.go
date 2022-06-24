@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	_ "net/http/pprof"
 
@@ -200,6 +201,10 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	rawMonitorDb := initDatabase(nodeCtx, config.Configuration.Chain.MonitorDbPath, config.Configuration.Chain.MonitorDbInMemory)
 	defer rawMonitorDb.Close()
 
+	// giving some time to services finish their work on the databases to avoid
+	// panic when closing the databases
+	defer func() { <-time.After(3 * time.Second) }()
+
 	/////////////////////////////////////////////////////////////////////////////
 	// INITIALIZE ALL SERVICE OBJECTS ///////////////////////////////////////////
 	/////////////////////////////////////////////////////////////////////////////
@@ -276,16 +281,16 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	defer txWatcher.Close()
 
 	// Setup tasks scheduler
-	taskRequestChan := make(chan tasks.Task, constants.TaskSchedulerBufferSize)
-	taskKillChan := make(chan string, constants.TaskSchedulerBufferSize)
+	taskRequestChan := make(chan tasks.TaskRequest, constants.TaskSchedulerBufferSize)
+	defer close(taskRequestChan)
 
-	tasksScheduler, err := executor.NewTasksScheduler(monDB, eth, consAdminHandlers, taskRequestChan, taskKillChan, txWatcher)
+	tasksScheduler, err := executor.NewTasksScheduler(monDB, eth, consAdminHandlers, taskRequestChan, txWatcher)
 	if err != nil {
 		panic(err)
 	}
 
 	monitorInterval := config.Configuration.Monitor.Interval
-	mon, err := monitor.NewMonitor(consDB, monDB, consAdminHandlers, appDepositHandler, eth, monitorInterval, uint64(batchSize), taskRequestChan, taskKillChan)
+	mon, err := monitor.NewMonitor(consDB, monDB, consAdminHandlers, appDepositHandler, eth, monitorInterval, uint64(batchSize), taskRequestChan)
 	if err != nil {
 		panic(err)
 	}
@@ -306,9 +311,6 @@ func validatorNode(cmd *cobra.Command, args []string) {
 	//////////////////////////////////////////////////////////////////////////////
 	//LAUNCH ALL SERVICE GOROUTINES///////////////////////////////////////////////
 	//////////////////////////////////////////////////////////////////////////////
-
-	defer close(taskRequestChan)
-	defer close(taskKillChan)
 
 	go storage.Start()
 
@@ -365,7 +367,7 @@ func validatorNode(cmd *cobra.Command, args []string) {
 }
 
 // countSignals will cause a forced exit on repeated Ctrl+C commands
-// this is a convient escape from a deadlock during shutdown
+// this is a convenient escape from a deadlock during shutdown
 func countSignals(logger *logrus.Logger, num int, c chan os.Signal) {
 	<-c
 	for count := 0; count < num; count++ {

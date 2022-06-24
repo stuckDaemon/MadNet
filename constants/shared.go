@@ -4,7 +4,7 @@ import "time"
 
 const (
 	// EpochLength is the number of blocks in an epoch for MadNet
-	EpochLength uint32 = 1024
+	EpochLength uint32 = 32
 
 	// HashLen specifies the length of a hash in bytes
 	HashLen = 32
@@ -95,8 +95,36 @@ const (
 )
 
 // TODO Find a way to store this list that feels right
-var ValidLoggers []string = []string{"madnet", "consensus", "transport", "app", "db",
-	"gossipbus", "badger", "peerman", "localrpc", "dman", "peer", "yamux",
-	"ethereum", "main", "deploy", "utils", "monitor", "dkg",
-	"services", "settings", "validator", "muxhandler", "bootnode", "p2pmux",
-	"status", "test", "ipc", "firewalld", "transaction", "tasks"}
+var ValidLoggers []string = []string{
+	"madnet",
+	"consensus",
+	"transport",
+	"app",
+	"db",
+	"gossipbus",
+	"badger",
+	"peerman",
+	"localrpc",
+	"dman",
+	"peer",
+	"yamux",
+	"ethereum",
+	"main",
+	"deploy",
+	"utils",
+	"monitor",
+	"dkg",
+	"services",
+	"settings",
+	"validator",
+	"muxhandler",
+	"bootnode",
+	"p2pmux",
+	"status",
+	"test",
+	"ipc",
+	"firewalld",
+	"transaction",
+	"tasks",
+	"staterecover",
+}

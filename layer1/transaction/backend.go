@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,21 +26,33 @@ import (
 
 type FuncSelector [4]byte
 
+var FuncSelectorT = reflect.TypeOf(FuncSelector{})
+
 // MarshalText returns the hex representation of a.
 func (fs FuncSelector) MarshalText() ([]byte, error) {
 	return hexutil.Bytes(fs[:]).MarshalText()
 }
 
 // UnmarshalText parses a hash in hex syntax.
-func (fs FuncSelector) UnmarshalText(input []byte) error {
+func (fs *FuncSelector) UnmarshalText(input []byte) error {
 	return hexutil.UnmarshalFixedText("FuncSelector", input, fs[:])
+}
+
+//// MarshalJSON returns the hex representation of a.
+//func (fs FuncSelector) MarshalJSON() ([]byte, error) {
+//	return json.Marshal(fmt.Sprintf("%s", fs[:]))
+//}
+
+// UnmarshalJSON parses a hash in hex syntax.
+func (fs *FuncSelector) UnmarshalJSON(input []byte) error {
+	return hexutil.UnmarshalFixedJSON(FuncSelectorT, input, fs[:])
 }
 
 // Internal struct to keep track of transactions that are being monitoring
 type info struct {
 	Txn               *types.Transaction `json:"txn"`               // Transaction object
 	FromAddress       common.Address     `json:"fromAddress"`       // address of the transaction signer
-	Selector          FuncSelector       `json:"selector"`          // 4 bytes that identify the function being called by the tx
+	Selector          *FuncSelector      `json:"selector"`          // 4 bytes that identify the function being called by the tx
 	FunctionSignature string             `json:"functionSignature"` // function signature as we see on the smart contracts
 	RetryGroup        common.Hash        `json:"retryGroup"`        // internal group Id to keep track of all tx that were created during the retry of a tx
 	EnableAutoRetry   bool               `json:"disableAutoRetry"`  // whether we should disable the auto retry of a transaction
@@ -51,7 +65,7 @@ type info struct {
 func newInfo(
 	txn *types.Transaction,
 	fromAddr common.Address,
-	selector FuncSelector,
+	selector *FuncSelector,
 	sig string,
 	retryGroup common.Hash,
 	enableAutoRetry bool,
@@ -313,9 +327,10 @@ func newWatcherBackend(mainCtx context.Context, requestChannel <-chan SubscribeR
 
 // Load the watcher backend state from the database.
 func (wb *WatcherBackend) LoadState() error {
+	logger := logging.GetLogger("staterecover").WithField("State", "txWatcherBackend")
 	if err := wb.database.View(func(txn *badger.Txn) error {
 		key := dbprefix.PrefixTransactionWatcherState()
-		wb.logger.WithField("Key", string(key)).Debug("Looking up state")
+		logger.WithField("Key", string(key)).Debug("Loading state from database")
 		rawData, err := utils.GetValue(txn, key)
 		if err != nil {
 			return err
@@ -323,6 +338,10 @@ func (wb *WatcherBackend) LoadState() error {
 		err = json.Unmarshal(rawData, wb)
 		if err != nil {
 			return err
+		}
+		for groupHash, group := range wb.RetryGroups {
+			group.receiptResponse = newSharesReceipt()
+			wb.RetryGroups[groupHash] = group
 		}
 		return nil
 	}); err != nil {
@@ -333,13 +352,14 @@ func (wb *WatcherBackend) LoadState() error {
 
 // Persist the watcher backend state into the database.
 func (wb *WatcherBackend) PersistState() error {
+	logger := logging.GetLogger("staterecover").WithField("State", "txWatcherBackend")
 	rawData, err := json.Marshal(wb)
 	if err != nil {
 		return fmt.Errorf("failed to marshal %v", err)
 	}
 	err = wb.database.Update(func(txn *badger.Txn) error {
 		key := dbprefix.PrefixTransactionWatcherState()
-		wb.logger.WithField("Key", string(key)).Debug("Saving state")
+		logger.WithField("Key", string(key)).Debug("Saving state in the database")
 		if err := utils.SetValue(txn, key, rawData); err != nil {
 			return fmt.Errorf("failed to set Value %v", err)
 		}
@@ -358,6 +378,14 @@ func (wb *WatcherBackend) PersistState() error {
 
 // Main loop where do all the backend actions
 func (wb *WatcherBackend) Loop() {
+
+	wb.logger.Info(strings.Repeat("-", 80))
+	wb.logger.Infof("Current Monitored Txns: %d", len(wb.MonitoredTxns))
+	for txnHash, info := range wb.MonitoredTxns {
+		getTransactionLogger(info).Infof("hash: %v", txnHash)
+	}
+	wb.logger.Info(strings.Repeat("-", 80))
+
 	poolingTime := time.After(constants.TxPollingTime)
 	statusTime := time.After(constants.TxStatusTime)
 	for {
@@ -428,7 +456,7 @@ func (wb *WatcherBackend) queue(req SubscribeRequest) (*SharedReceipt, error) {
 					fmt.Sprintf("invalid request, transaction data is not present %v, err %v!", txnHash.Hex(), err),
 				}
 			}
-			sig := bindings.FunctionMapping[selector]
+			sig := bindings.FunctionMapping[*selector]
 
 			var enableAutoRetry bool
 			var maxStaleBlocks uint64
@@ -479,10 +507,17 @@ func (wb *WatcherBackend) collectReceipts() {
 	}
 
 	if wb.lastProcessedBlock.Equal(blockInfo) {
-		wb.logger.Tracef("already processed block: %v with hash: %v", blockInfo.Height, blockInfo.Hash.Hex())
+		wb.logger.WithFields(logrus.Fields{
+			"BlockHeight": blockInfo.Height,
+			"BlockHash":   blockInfo.Hash.Hex(),
+		}).Trace("already processed block")
 		return
 	}
-	wb.logger.Tracef("processing block: %v with hash: %v", blockInfo.Height, blockInfo.Hash.Hex())
+	wb.logger.WithFields(logrus.Fields{
+		"NumberOfTransactions": lenMonitoredTxns,
+		"BlockHeight":          blockInfo.Height,
+		"BlockHash":            blockInfo.Hash.Hex(),
+	}).Trace("processing a new block")
 
 	baseFee, tipCap, err := wb.client.GetBlockBaseFeeAndSuggestedGasTip(networkCtx)
 	if err != nil {
@@ -622,7 +657,7 @@ func (wb *WatcherBackend) dispatchFinishedTxs(finishedTxs map[common.Hash]Monito
 					"group": txnInfo.RetryGroup,
 				})
 				if workResponse.receipt != nil {
-					wb.Aggregates[txnInfo.Selector] = wb.computeGasProfile(workResponse.receipt, txnInfo)
+					wb.Aggregates[*txnInfo.Selector] = wb.computeGasProfile(workResponse.receipt, txnInfo)
 				}
 				txGroup.sendReceipt(logger, workResponse.receipt, workResponse.err)
 				err := txGroup.remove(txnHash)
@@ -647,8 +682,8 @@ func (wb *WatcherBackend) dispatchFinishedTxs(finishedTxs map[common.Hash]Monito
 // Compute the gas profile for every transaction that returned a receipt
 func (wb *WatcherBackend) computeGasProfile(rcpt *types.Receipt, txnInfo info) Profile {
 	var profile Profile
-	if _, present := wb.Aggregates[txnInfo.Selector]; present {
-		profile = wb.Aggregates[txnInfo.Selector]
+	if _, present := wb.Aggregates[*txnInfo.Selector]; present {
+		profile = wb.Aggregates[*txnInfo.Selector]
 	} else {
 		profile = Profile{}
 	}
@@ -670,10 +705,10 @@ func (wb *WatcherBackend) computeGasProfile(rcpt *types.Receipt, txnInfo info) P
 
 // Extract the selector for a layer1 smart contract call (the first 4 bytes in
 // the call data)
-func ExtractSelector(data []byte) (FuncSelector, error) {
-	var selector [4]byte
+func ExtractSelector(data []byte) (*FuncSelector, error) {
+	selector := &FuncSelector{}
 	if len(data) < 4 {
-		return selector, fmt.Errorf("couldn't extract selector for data: %v", data)
+		return nil, fmt.Errorf("couldn't extract selector for data: %v", data)
 	}
 	for idx := 0; idx < 4; idx++ {
 		selector[idx] = data[idx]
@@ -685,5 +720,6 @@ func getTransactionLogger(txn info) *logrus.Entry {
 	logger := logging.GetLogger("transaction").WithField("Component", "TransactionWatcher")
 	return logger.WithField("Transaction", txn.Txn.Hash().Hex()).
 		WithField("Function", txn.FunctionSignature).
-		WithField("Selector", fmt.Sprintf("%x", txn.Selector))
+		WithField("Selector", fmt.Sprintf("%x", *txn.Selector)).
+		WithField("FromAddress", txn.FromAddress.Hex())
 }

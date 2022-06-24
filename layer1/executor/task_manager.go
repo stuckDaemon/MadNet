@@ -12,6 +12,7 @@ import (
 	"github.com/MadBase/MadNet/layer1"
 	"github.com/MadBase/MadNet/layer1/executor/tasks"
 	"github.com/MadBase/MadNet/layer1/transaction"
+	"github.com/MadBase/MadNet/logging"
 	"github.com/MadBase/MadNet/utils"
 	"github.com/dgraph-io/badger/v2"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -47,30 +48,31 @@ func NewTaskManager(txWatcher *transaction.FrontWatcher, database *db.Database, 
 
 // main function to manage a task. It basically an abstraction to handle the
 // task execution in a separate process.
-func (tm *TasksManager) ManageTask(mainCtx context.Context, task tasks.Task, taskId string, database *db.Database, logger *logrus.Entry, eth layer1.Client, taskResponseChan tasks.TaskResponseChan) {
-	var err error
+func (tm *TasksManager) ManageTask(mainCtx context.Context, task tasks.Task, name string, taskId string, database *db.Database, logger *logrus.Entry, eth layer1.Client, taskResponseChan tasks.TaskResponseChan) {
+	err := tm.processTask(mainCtx, task, name, taskId, database, logger, eth, taskResponseChan)
+	task.Finish(err)
+}
+
+func (tm *TasksManager) processTask(mainCtx context.Context, task tasks.Task, name string, taskId string, database *db.Database, logger *logrus.Entry, eth layer1.Client, taskResponseChan tasks.TaskResponseChan) error {
 	taskCtx, cf := context.WithCancel(mainCtx)
 	defer cf()
 	defer task.Close()
-	defer task.Finish(err)
-
-	err = task.Initialize(taskCtx, cf, database, logger, eth, taskId, taskResponseChan)
+	err := task.Initialize(taskCtx, cf, database, logger, eth, name, taskId, taskResponseChan)
 	if err != nil {
-		return
+		return err
 	}
 	retryDelay := constants.MonitorRetryDelay
-
 	isComplete := false
 	if txn, present := tm.Transactions[task.GetId()]; present {
 		isComplete, err = tm.checkCompletion(taskCtx, task, txn)
 		if err != nil {
-			return
+			return err
 		}
 	} else {
 		err = prepareTask(taskCtx, task, retryDelay)
 		if err != nil {
 			// unrecoverable errors or ctx.done
-			return
+			return err
 		}
 	}
 
@@ -78,13 +80,17 @@ func (tm *TasksManager) ManageTask(mainCtx context.Context, task tasks.Task, tas
 		err = tm.executeTask(taskCtx, task, retryDelay)
 		if err != nil {
 			// unrecoverable errors, staleTx errors or ctx.done
-			return
+			return err
 		}
 	}
 
 	// We got a successful receipt, removing from state
 	delete(tm.Transactions, task.GetId())
 	err = tm.persistState()
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // prepareTask executes task preparation. We keep retrying until the task is
@@ -124,14 +130,14 @@ func (tm *TasksManager) executeTask(ctx context.Context, task tasks.Task, retryD
 			txn, taskErr := task.Execute(ctx)
 			if taskErr != nil {
 				if taskErr.IsRecoverable() {
-					logger.Trace("got a recoverable error during task.execute: %v", taskErr.Error())
+					logger.Tracef("got a recoverable error during task.execute: %v", taskErr.Error())
 					err := sleepWithContext(ctx, retryDelay)
 					if err != nil {
 						return err
 					}
 					continue
 				}
-				logger.Debug("got a unrecoverable error during task.execute finishing execution err: %v", taskErr.Error())
+				logger.Debugf("got a unrecoverable error during task.execute finishing execution err: %v", taskErr.Error())
 				return taskErr
 			}
 			if txn != nil {
@@ -149,16 +155,18 @@ func (tm *TasksManager) executeTask(ctx context.Context, task tasks.Task, retryD
 				if isComplete {
 					return nil
 				}
+				continue
 			} else {
 				logger.Debug("Task returned no transaction, finishing")
 				return nil
 			}
 		}
+		return nil
 	}
 }
 
 // checks if a task is complete. The function is going to subscribe a
-// transaction in the transactionWatcher and it will wait until it gets the
+// transaction in the transactionWatcher, and it will wait until it gets the
 // receipt, the task is killed, or shouldExecute returns false.
 func (tm *TasksManager) checkCompletion(ctx context.Context, task tasks.Task, txn *types.Transaction) (bool, error) {
 	var err error
@@ -195,9 +203,11 @@ func (tm *TasksManager) checkCompletion(ctx context.Context, task tasks.Task, tx
 				logger.Debug("got a successful receipt")
 				return true, nil
 			} else {
-				logger.Debug("got a reverted receipt")
+				logger.Warn("got a reverted receipt, retrying")
 				return false, nil
 			}
+		} else {
+			logger.Trace("receipt is not ready yet")
 		}
 
 		hasToExecute, err := shouldExecute(ctx, task)
@@ -245,6 +255,7 @@ func shouldExecute(ctx context.Context, task tasks.Task) (bool, error) {
 
 // persist task manager state to disk
 func (tm *TasksManager) persistState() error {
+	logger := logging.GetLogger("staterecover").WithField("State", "taskManager")
 	rawData, err := json.Marshal(tm)
 	if err != nil {
 		return err
@@ -252,9 +263,9 @@ func (tm *TasksManager) persistState() error {
 
 	err = tm.database.Update(func(txn *badger.Txn) error {
 		key := dbprefix.PrefixTaskManagerState()
-		tm.logger.WithField("Key", string(key)).Debug("Saving state")
+		logger.WithField("Key", string(key)).Debug("Saving state in the database")
 		if err := utils.SetValue(txn, key, rawData); err != nil {
-			tm.logger.Error("Failed to set Value")
+			logger.Error("Failed to set Value")
 			return err
 		}
 		return nil
@@ -264,7 +275,7 @@ func (tm *TasksManager) persistState() error {
 	}
 
 	if err := tm.database.Sync(); err != nil {
-		tm.logger.Error("Failed to set sync")
+		logger.Error("Failed to set sync")
 		return err
 	}
 
@@ -273,10 +284,10 @@ func (tm *TasksManager) persistState() error {
 
 // load task's manager state from database
 func (tm *TasksManager) loadState() error {
-
+	logger := logging.GetLogger("staterecover").WithField("State", "taskManager")
 	if err := tm.database.View(func(txn *badger.Txn) error {
 		key := dbprefix.PrefixTaskManagerState()
-		tm.logger.WithField("Key", string(key)).Debug("Looking up state")
+		logger.WithField("Key", string(key)).Debug("Loading state from database")
 		rawData, err := utils.GetValue(txn, key)
 		if err != nil {
 			return err
@@ -294,7 +305,7 @@ func (tm *TasksManager) loadState() error {
 
 	// synchronizing db state to disk
 	if err := tm.database.Sync(); err != nil {
-		tm.logger.Error("Failed to set sync")
+		logger.Error("Failed to set sync")
 		return err
 	}
 

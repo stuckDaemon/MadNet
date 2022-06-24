@@ -12,11 +12,10 @@ import (
 	"github.com/MadBase/MadNet/crypto"
 	"github.com/MadBase/MadNet/crypto/bn256"
 	"github.com/MadBase/MadNet/layer1/ethereum"
-	"github.com/MadBase/MadNet/layer1/executor/constants"
+
 	"github.com/MadBase/MadNet/layer1/executor/tasks"
 	"github.com/MadBase/MadNet/layer1/executor/tasks/dkg/state"
 	"github.com/MadBase/MadNet/layer1/executor/tasks/dkg/utils"
-	"github.com/MadBase/MadNet/layer1/transaction"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,7 +32,7 @@ var _ tasks.Task = &DisputeGPKjTask{}
 // NewDisputeGPKjTask creates a background task that attempts perform a group accusation if necessary
 func NewDisputeGPKjTask(start uint64, end uint64, address common.Address) *DisputeGPKjTask {
 	return &DisputeGPKjTask{
-		BaseTask: tasks.NewBaseTask(constants.DisputeGPKjTaskName, start, end, false, transaction.NewSubscribeOptions(true, constants.ETHDKGMaxStaleBlocks)),
+		BaseTask: tasks.NewBaseTask(start, end, false, nil),
 		Address:  address,
 	}
 }
@@ -41,19 +40,19 @@ func NewDisputeGPKjTask(start uint64, end uint64, address common.Address) *Dispu
 // Prepare prepares for work to be done in the DisputeGPKjTask.
 // Here, we determine if anyone submitted an invalid gpkj.
 func (t *DisputeGPKjTask) Prepare(ctx context.Context) *tasks.TaskErr {
-	logger := t.GetLogger().WithField("method", "Prepare()")
+	logger := t.GetLogger().WithField("method", "Prepare()").WithField("address", t.Address)
 	logger.Debug("preparing task")
 	return nil
 }
 
 // Execute executes the task business logic
 func (t *DisputeGPKjTask) Execute(ctx context.Context) (*types.Transaction, *tasks.TaskErr) {
-	logger := t.GetLogger().WithField("method", "Execute()")
+	logger := t.GetLogger().WithField("method", "Execute()").WithField("address", t.Address)
 	logger.Debug("initiate execution")
 
 	dkgState, err := state.GetDkgState(t.GetDB())
 	if err != nil {
-		return nil, tasks.NewTaskErr(fmt.Sprintf(constants.ErrorLoadingDkgState, err), false)
+		return nil, tasks.NewTaskErr(fmt.Sprintf(tasks.ErrorLoadingDkgState, err), false)
 	}
 
 	if dkgState.Phase != state.DisputeGPKJSubmission && dkgState.Phase != state.GPKJSubmission {
@@ -95,18 +94,19 @@ func (t *DisputeGPKjTask) Execute(ctx context.Context) (*types.Transaction, *tas
 		}
 	}
 
-	// address didn't shared it's gpkj another task will be responsible for accusing him
+	logger.Tracef("finishing accusation task, %v is not dishonest ", t.Address.Hex())
+	// address didn't shared it's gpkj, another task will be responsible for accusing him
 	return nil, nil
 }
 
 // ShouldExecute checks if it makes sense to execute the task
 func (t *DisputeGPKjTask) ShouldExecute(ctx context.Context) (bool, *tasks.TaskErr) {
-	logger := t.GetLogger().WithField("method", "ShouldExecute()")
+	logger := t.GetLogger().WithField("method", "ShouldExecute()").WithField("address", t.Address)
 	logger.Debug("should execute task")
 
 	dkgState, err := state.GetDkgState(t.GetDB())
 	if err != nil {
-		return false, tasks.NewTaskErr(fmt.Sprintf(constants.ErrorLoadingDkgState, err), false)
+		return false, tasks.NewTaskErr(fmt.Sprintf(tasks.ErrorLoadingDkgState, err), false)
 	}
 
 	if dkgState.Phase != state.DisputeGPKJSubmission {
@@ -116,9 +116,9 @@ func (t *DisputeGPKjTask) ShouldExecute(ctx context.Context) (bool, *tasks.TaskE
 
 	isValidator, err := utils.IsValidator(t.GetDB(), logger, t.Address)
 	if err != nil {
-		return false, tasks.NewTaskErr(fmt.Sprintf(constants.FailedGettingIsValidator, err), false)
+		return false, tasks.NewTaskErr(fmt.Sprintf(tasks.FailedGettingIsValidator, err), false)
 	}
-	logger.WithFields(logrus.Fields{"eth.badParticipant": t.Address.Hex()}).Debug("participant already accused")
+	logger.WithFields(logrus.Fields{"eth.badParticipant": t.Address.Hex()}).Debug("participant was not accused yet")
 
 	return isValidator, nil
 }
@@ -146,12 +146,12 @@ func (t *DisputeGPKjTask) accuseDishonestValidator(ctx context.Context, logger *
 	// Setup
 	txnOpts, err := client.GetTransactionOpts(ctx, dkgState.Account)
 	if err != nil {
-		return nil, tasks.NewTaskErr(fmt.Sprintf(constants.FailedGettingTxnOpts, err), true)
+		return nil, tasks.NewTaskErr(fmt.Sprintf(tasks.FailedGettingTxnOpts, err), true)
 	}
 
 	isValidator, err := utils.IsValidator(t.GetDB(), logger, t.Address)
 	if err != nil {
-		return nil, tasks.NewTaskErr(fmt.Sprintf(constants.FailedGettingIsValidator, err), false)
+		return nil, tasks.NewTaskErr(fmt.Sprintf(tasks.FailedGettingIsValidator, err), false)
 	}
 
 	// it means that the guys was already accused and evicted from the validatorPool
