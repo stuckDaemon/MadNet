@@ -1,12 +1,12 @@
-package utils
+package tasks
 
 import (
 	"crypto/ecdsa"
 	"fmt"
+	"github.com/MadBase/MadNet/layer1/tests"
 	"math/big"
 	"testing"
 
-	"github.com/MadBase/MadNet/blockchain/testutils"
 	"github.com/MadBase/MadNet/bridge/bindings"
 	"github.com/MadBase/MadNet/consensus/objs"
 	"github.com/MadBase/MadNet/constants"
@@ -67,8 +67,8 @@ func InitializeNewNonDetDkgStateInfo(n int) ([]*state.DkgState, []*ecdsa.Private
 
 func InitializeNewDkgStateInfo(n int, deterministicShares bool) ([]*state.DkgState, []*ecdsa.PrivateKey) {
 	// Get private keys for validators
-	privKeys := testutils.SetupPrivateKeys(n)
-	accountsArray := testutils.SetupAccounts(privKeys)
+	privKeys := tests.SetupPrivateKeys(n)
+	accountsArray := tests.SetupAccounts(privKeys)
 	dkgStates := []*state.DkgState{}
 	threshold := crypto.CalcThreshold(n)
 
